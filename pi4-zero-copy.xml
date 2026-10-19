@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Raspberry Pi 4 zero-copy video: use the pi4-zero-copy branches instead of
+     the raspberry-vanilla projects. Copy into .repo/local_manifests/ after
+     manifest_brcm_rpi.xml, and remove any local manifest that extends the
+     four replaced projects (for example a pinned ffmpeg revision). -->
+<manifest>
+  <remote name="pi4zc" fetch="https://github.com/ayooooo123/" />
+
+  <remove-project name="raspberry-vanilla/android_device_brcm_rpi4" />
+  <remove-project name="raspberry-vanilla/android_external_ffmpeg" />
+  <remove-project name="raspberry-vanilla/android_external_ffmpeg_codec2" />
+  <remove-project name="raspberry-vanilla/android_external_minigbm" />
+
+  <project path="device/brcm/rpi4" name="android_device_brcm_rpi4" remote="pi4zc" revision="pi4-zero-copy" >
+    <linkfile src="mkimg.sh" dest="rpi4-mkimg.sh" />
+    <linkfile src="wrimg.sh" dest="rpi4-wrimg.sh" />
+  </project>
+  <project path="external/ffmpeg" name="android_external_ffmpeg" remote="pi4zc" revision="pi4-zero-copy" />
+  <project path="external/ffmpeg_codec2" name="android_external_ffmpeg_codec2" remote="pi4zc" revision="pi4-zero-copy" />
+  <project path="external/minigbm" name="android_external_minigbm" remote="pi4zc" revision="pi4-zero-copy" />
+</manifest>
