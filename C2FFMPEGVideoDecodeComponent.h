@@ -22,10 +22,38 @@
 #include <SimpleC2Component.h>
 #include "C2FFMPEGCommon.h"
 #include "C2FFMPEGVideoDecodeInterface.h"
+#include "C2FFMPEGZeroCopyRegistry.h"
+#include "ZeroCopyQuarantine.h"
+#include <cros_gralloc/cros_gralloc_handle.h>
+#include <unordered_map>
+#include <vector>
 
 namespace android {
 
 typedef std::pair<uint64_t, uint64_t> PendingWork;
+struct DrmBufEntry {
+    uint32_t id = 0;
+    uint64_t ino = 0;
+    int dma_buf_fd = -1;
+    int meta_fd = -1;
+    struct cros_gralloc_handle* cros_handle = nullptr;
+    AVFrame* heldFrame = nullptr;
+    enum State {
+        FREE_IN_FFMPEG = 0,
+        HELD_UNSENT = 1,
+        AT_CLIENT_OR_BQ = 2,
+        DETACHED_FENCE_PENDING = 3,
+    } state = FREE_IN_FFMPEG;
+    int32_t currentSlot = -1;
+    uint32_t staleInstances = 0;
+};
+
+struct PendingFenceBuffer {
+    uint32_t bufId = 0;
+    int fenceFd = -1;
+    bool hasRealFence = false;
+};
+
 
 class C2FFMPEGVideoDecodeComponent : public SimpleC2Component {
 public:
@@ -62,6 +90,15 @@ private:
     void pushPendingWork(const std::unique_ptr<C2Work>& work);
     void popPendingWork(const std::unique_ptr<C2Work>& work);
     void prunePendingWorksUntil(const std::unique_ptr<C2Work>& work);
+    void drainDetachNextBuffer(
+            const sp<::android::hardware::graphics::bufferqueue::V2_0::IGraphicBufferProducer>& producer,
+            const std::shared_ptr<C2SurfaceSyncMemory>& syncMem);
+    void clearZeroCopyBuffers();
+    void destroyZeroCopyBuffers();
+    size_t getHeldFrameCount() const;
+    void reclaimBufferById(uint32_t bufId, bool hasRealFence);
+    bool isZeroCopyCandidate() const;
+
 
 private:
     const C2FFMPEGComponentInfo* mInfo;
@@ -82,6 +119,32 @@ private:
     // sent with the next output picture.
     std::vector<std::unique_ptr<C2Param>> mPendingConfigUpdate;
     std::deque<PendingWork> mPendingWorkQueue;
+    // Zero-copy state
+    bool mZeroCopyMode;
+    bool mZeroCopySupported;
+    uint32_t mLastProducerChangeSeq;
+    uint32_t mLastGeneration;
+    uint32_t mLastReportedChangeSeq;
+    std::vector<DrmBufEntry> mDrmBuffers;
+    std::unordered_map<uint64_t, size_t> mInoToBufIndex;
+    int mSlotToBufIndex[64];
+    ZeroCopyQuarantine<AVFrame*> mQuarantine;
+    std::vector<PendingFenceBuffer> mPendingFences;
+    uint64_t mOutputPoolId;
+    void* mLastHwFramesCtxData;
+    uint64_t mReclaimSeq;
+    size_t mHeldCap;
+
+    sp<::android::hardware::graphics::bufferqueue::V2_0::IGraphicBufferProducer> mCurrentProducer;
+    std::shared_ptr<C2SurfaceSyncMemory> mCurrentSyncMem;
+
+    // Zero-copy counters
+    size_t mReclaimedCount;
+    size_t mAttachFailCount;
+    size_t mQuarantinedCount;
+    int64_t mLastStatLogUs;
+    std::atomic<int> mLiveHalRefs;
+    uint32_t mOutputCount;
 };
 
 } // namespace android

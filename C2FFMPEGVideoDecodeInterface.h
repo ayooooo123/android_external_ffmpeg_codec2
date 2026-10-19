@@ -34,6 +34,8 @@ public:
     const std::shared_ptr<C2StreamPixelFormatInfo::output>&
         getPixelFormatInfo() const { return mPixelFormat; }
     uint32_t getOutputDelay() const { return mActualOutputDelay->value; }
+    const std::shared_ptr<C2StreamColorAspectsInfo::output>&
+        getColorAspectsInfo() const { return mColorAspects; }
 
 private:
     static C2R SizeSetter(
@@ -44,6 +46,9 @@ private:
         bool mayBlock,
         C2P<C2StreamProfileLevelInfo::input> &me,
         const C2P<C2StreamPictureSizeInfo::output> &size);
+    static C2R ColorAspectsSetter(
+        bool mayBlock,
+        C2P<C2StreamColorAspectsInfo::output> &me);
 
 private:
     std::shared_ptr<C2StreamPictureSizeInfo::output> mSize;
@@ -51,6 +56,7 @@ private:
     std::shared_ptr<C2StreamColorInfo::output> mColorInfo;
     std::shared_ptr<C2StreamPixelFormatInfo::output> mPixelFormat;
     std::shared_ptr<C2StreamUsageTuning::output> mConsumerUsage;
+    std::shared_ptr<C2StreamColorAspectsInfo::output> mColorAspects;
 };
 
 } // namespace android

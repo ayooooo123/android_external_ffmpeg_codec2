@@ -115,13 +115,11 @@ C2FFMPEGVideoDecodeInterface::C2FFMPEGVideoDecodeInterface(
     }
 
     else if (strcasecmp(componentInfo->mediaType, MEDIA_MIMETYPE_VIDEO_HEVC) == 0) {
+        bool zerocopy_prop = base::GetBoolProperty("persist.vendor.ffmpeg_codec2.zerocopy", true);
+        uint32_t defaultDelay = zerocopy_prop ? 8u : 6u;
         addParameter(
                 DefineParam(mActualOutputDelay, C2_PARAMKEY_OUTPUT_DELAY)
-                // 6, not 8: at 4K each output buffer is ~12 MB of the Pi's
-                // 512 MB CMA (shared with the decoder and the display). The
-                // component still raises it (8, then 12) if pending work
-                // outgrows it.
-                .withDefault(new C2PortActualDelayTuning::output(6u))
+                .withDefault(new C2PortActualDelayTuning::output(defaultDelay))
                 .withFields({C2F(mActualOutputDelay, value).inRange(0, 34u)})
                 .withSetter(Setter<decltype(*mActualOutputDelay)>::StrictValueWithNoDeps)
                 .build());
@@ -243,6 +241,24 @@ C2FFMPEGVideoDecodeInterface::C2FFMPEGVideoDecodeInterface(
             .build());
 
     addParameter(
+            DefineParam(mColorAspects, C2_PARAMKEY_COLOR_ASPECTS)
+            .withDefault(new C2StreamColorAspectsInfo::output(
+                    0u, C2Color::RANGE_UNSPECIFIED, C2Color::PRIMARIES_UNSPECIFIED,
+                    C2Color::TRANSFER_UNSPECIFIED, C2Color::MATRIX_UNSPECIFIED))
+            .withFields({
+                C2F(mColorAspects, range).inRange(
+                            C2Color::RANGE_UNSPECIFIED, C2Color::RANGE_OTHER),
+                C2F(mColorAspects, primaries).inRange(
+                            C2Color::PRIMARIES_UNSPECIFIED, C2Color::PRIMARIES_OTHER),
+                C2F(mColorAspects, transfer).inRange(
+                            C2Color::TRANSFER_UNSPECIFIED, C2Color::TRANSFER_OTHER),
+                C2F(mColorAspects, matrix).inRange(
+                            C2Color::MATRIX_UNSPECIFIED, C2Color::MATRIX_OTHER)
+            })
+            .withSetter(ColorAspectsSetter)
+            .build());
+
+    addParameter(
             DefineParam(mConsumerUsage, C2_PARAMKEY_OUTPUT_STREAM_USAGE)
             .withDefault(new C2StreamUsageTuning::output(
                                 0u, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_COMPOSER))
@@ -250,6 +266,12 @@ C2FFMPEGVideoDecodeInterface::C2FFMPEGVideoDecodeInterface(
             .withSetter(Setter<decltype(*mConsumerUsage)>::StrictValueWithNoDeps)
             .build());
 }
+C2R C2FFMPEGVideoDecodeInterface::ColorAspectsSetter(
+        bool /* mayBlock */,
+        C2P<C2StreamColorAspectsInfo::output> &/* me */) {
+    return C2R::Ok();
+}
+
 
 C2R C2FFMPEGVideoDecodeInterface::SizeSetter(
         bool /* mayBlock */,

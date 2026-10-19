@@ -7,6 +7,13 @@ cc_defaults {
     name: "ffmpeg_codec2_defaults",
     relative_install_path: "hw",
     vendor: true,
+    include_dirs: [
+        "bionic/libc/kernel/uapi/drm",
+        "external/minigbm",
+    ],
+    header_libs: [
+        "libcodec2_internal",
+    ],
     srcs: [
         "C2FFMPEGAudioDecodeComponent.cpp",
         "C2FFMPEGAudioDecodeInterface.cpp",
@@ -14,8 +21,10 @@ cc_defaults {
         "C2FFMPEGComponentStore.cpp",
         "C2FFMPEGVideoDecodeComponent.cpp",
         "C2FFMPEGVideoDecodeInterface.cpp",
+        "C2FFMPEGZeroCopyRegistry.cpp",
     ],
     shared_libs: [
+        "android.hardware.graphics.bufferqueue@2.0",
         "libavcodec",
         "libavservices_minijail",
         "libavutil",
@@ -23,10 +32,12 @@ cc_defaults {
         "libcodec2_soft_common",
         "libcodec2_vndk",
         "libffmpeg_utils",
+        "libcutils",
         "liblog",
         "libstagefright_foundation",
         "libswresample",
         "libswscale",
+        "libui",
         "libutils",
     ],
 }
@@ -39,6 +50,8 @@ cc_binary {
         "main-hidl.cpp",
     ],
     shared_libs: [
+        "android.hardware.media.c2@1.0",
+        "android.hardware.media.c2@1.1",
         "android.hardware.media.c2@1.2",
         "libbinder",
         "libcodec2_hidl@1.2",
@@ -88,5 +101,16 @@ apex {
     prebuilts: [
         "android.hardware.media.c2-service-ffmpeg.rc",
         "android.hardware.media.c2-service-ffmpeg.xml",
+    ],
+}
+
+cc_test {
+    name: "zerocopy_quarantine_test",
+    vendor: true,
+    srcs: [
+        "tests/ZeroCopyQuarantineTest.cpp",
+    ],
+    include_dirs: [
+        "external/ffmpeg_codec2",
     ],
 }
