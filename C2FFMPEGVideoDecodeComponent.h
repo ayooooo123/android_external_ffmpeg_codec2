@@ -75,6 +75,12 @@ private:
     bool mCodecAlreadyOpened;
     bool mExtradataReady;
     bool mEOSSignalled;
+    // Set once the one-pass transfer into the output buffer fails; later
+    // pictures use the temporary-copy + sws_scale path.
+    bool mDirectTransferFailed;
+    // configUpdate of a picture skipped after its size change was applied;
+    // sent with the next output picture.
+    std::vector<std::unique_ptr<C2Param>> mPendingConfigUpdate;
     std::deque<PendingWork> mPendingWorkQueue;
 };
 

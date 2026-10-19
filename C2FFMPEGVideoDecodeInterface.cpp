@@ -117,7 +117,11 @@ C2FFMPEGVideoDecodeInterface::C2FFMPEGVideoDecodeInterface(
     else if (strcasecmp(componentInfo->mediaType, MEDIA_MIMETYPE_VIDEO_HEVC) == 0) {
         addParameter(
                 DefineParam(mActualOutputDelay, C2_PARAMKEY_OUTPUT_DELAY)
-                .withDefault(new C2PortActualDelayTuning::output(8u))
+                // 6, not 8: at 4K each output buffer is ~12 MB of the Pi's
+                // 512 MB CMA (shared with the decoder and the display). The
+                // component still raises it (8, then 12) if pending work
+                // outgrows it.
+                .withDefault(new C2PortActualDelayTuning::output(6u))
                 .withFields({C2F(mActualOutputDelay, value).inRange(0, 34u)})
                 .withSetter(Setter<decltype(*mActualOutputDelay)>::StrictValueWithNoDeps)
                 .build());

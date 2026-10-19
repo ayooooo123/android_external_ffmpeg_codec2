@@ -24,6 +24,9 @@
 #include "ffmpeg_hwaccel.h"
 
 #define DEBUG_FRAMES 0
+#ifndef FFMPEG_HW_HEVC_THREADS
+#define FFMPEG_HW_HEVC_THREADS 2
+#endif
 #define DEBUG_WORKQUEUE 0
 #define DEBUG_EXTRADATA 0
 
@@ -43,7 +46,8 @@ C2FFMPEGVideoDecodeComponent::C2FFMPEGVideoDecodeComponent(
       mFFMPEGInitialized(false),
       mCodecAlreadyOpened(false),
       mExtradataReady(false),
-      mEOSSignalled(false) {
+      mEOSSignalled(false),
+      mDirectTransferFailed(false) {
     ALOGD("C2FFMPEGVideoDecodeComponent: mediaType = %s", componentInfo->mediaType);
 }
 
@@ -124,6 +128,18 @@ c2_status_t C2FFMPEGVideoDecodeComponent::openDecoder() {
     }
 
     ffmpeg_hwaccel_init(mCtx);
+    // HEVC through the V4L2 request hwaccel supports frame threads
+    // (HWACCEL_CAP_THREAD_SAFE): with two, parsing and submitting the next
+    // picture runs on FFmpeg's thread while this thread converts the last one
+    // into the output buffer. ffmpeg_hwaccel_init forces one thread.
+    if (mCtx->hw_device_ctx && mCtx->codec_id == AV_CODEC_ID_HEVC) {
+        mCtx->thread_count = FFMPEG_HW_HEVC_THREADS;
+        mCtx->thread_type = FF_THREAD_FRAME;
+        // Hardware pictures are converted into the output buffer and released
+        // at once, so 2 spare decoder buffers are enough (FFmpeg's default is
+        // 6). At 4K 10-bit each is ~16.5 MB of the Pi's 512 MB CMA.
+        mCtx->extra_hw_frames = 2;
+    }
 
     ALOGD("openDecoder: opening ffmpeg decoder(%s): threads = %d, hw = %s",
           avcodec_get_name(mCtx->codec_id), mCtx->thread_count, mCtx->hw_device_ctx ? "yes" : "no");
@@ -149,12 +165,21 @@ c2_status_t C2FFMPEGVideoDecodeComponent::openDecoder() {
 
 void C2FFMPEGVideoDecodeComponent::deInitDecoder() {
     ALOGD("%p deInitDecoder: %p", this, mCtx);
+    // A hardware picture kept for the direct transfer holds one of the
+    // decoder's buffers; drop it first so flushing and freeing the decoder
+    // never wait on a buffer this component still owns.
+    if (mFrame) {
+        av_frame_unref(mFrame);
+    }
     if (mCtx) {
         if (avcodec_is_open(mCtx)) {
+            ALOGD("deInitDecoder: flush");
             avcodec_flush_buffers(mCtx);
         }
         ffmpeg_hwaccel_deinit(mCtx);
+        ALOGD("deInitDecoder: free context");
         avcodec_free_context(&mCtx);
+        ALOGD("deInitDecoder: context freed");
         mCodecAlreadyOpened = false;
     }
     if (mFrame) {
@@ -172,6 +197,8 @@ void C2FFMPEGVideoDecodeComponent::deInitDecoder() {
     mEOSSignalled = false;
     mExtradataReady = false;
     mPendingWorkQueue.clear();
+    mPendingConfigUpdate.clear();
+    mDirectTransferFailed = false;
 }
 
 c2_status_t C2FFMPEGVideoDecodeComponent::processCodecConfig(C2ReadView* inBuffer) {
@@ -218,11 +245,18 @@ c2_status_t C2FFMPEGVideoDecodeComponent::sendInputBuffer(
 
     if (err < 0) {
         ALOGE("sendInputBuffer: failed to send data (%d) to decoder: %s (%08x)",
-              inBuffer->capacity(), av_err2str(err), err);
+              inBuffer ? (int)inBuffer->capacity() : 0, av_err2str(err), err);
         if (err == AVERROR(EAGAIN)) {
             // Frames must be read first, notify main decoding loop.
             ALOGD("sendInputBuffer: returning C2_BAD_STATE");
             return C2_BAD_STATE;
+        }
+        if (err == AVERROR(ENOMEM)) {
+            // The hardware decoder could not get picture memory (CMA). Report
+            // it: a silently consumed packet leaves pending work that never
+            // produces output, which grows the output delay and the number of
+            // output buffers, using more of the same memory.
+            return C2_NO_MEMORY;
         }
         // Otherwise don't send error to client.
     }
@@ -235,20 +269,31 @@ c2_status_t C2FFMPEGVideoDecodeComponent::receiveFrame(bool* hasPicture) {
 
     *hasPicture = false;
     if (err == 0) {
-        err = ffmpeg_hwaccel_get_frame(mCtx, mFrame);
+        // Hardware pictures stay in hardware until getOutputBuffer, which
+        // converts them straight into the output buffer.
+        err = (mFrame->hw_frames_ctx && !mDirectTransferFailed) ? 0 : ffmpeg_hwaccel_get_frame(mCtx, mFrame);
         if (err == 0) {
             *hasPicture = true;
         } else {
             ALOGE("receiveFrame: failed to receive frame from HW decoder err = %d", err);
+            if (err == AVERROR(ENOMEM)) {
+                return C2_NO_MEMORY;
+            }
             // Don't send error to client, skip frame!
         }
     } else if (err != AVERROR(EAGAIN) && err != AVERROR_EOF) {
         ALOGE("receiveFrame: failed to receive frame from decoder err = %d", err);
+        // With frame threads a decode error surfaces here, not on send.
+        if (err == AVERROR(ENOMEM)) {
+            return C2_NO_MEMORY;
+        }
         // Don't report error to client.
     }
 
     return C2_OK;
 }
+
+static void noFree(void* /* opaque */, uint8_t* /* data */) {}
 
 c2_status_t C2FFMPEGVideoDecodeComponent::getOutputBuffer(C2GraphicView* outBuffer) {
     uint8_t* data[4];
@@ -262,6 +307,56 @@ c2_status_t C2FFMPEGVideoDecodeComponent::getOutputBuffer(C2GraphicView* outBuff
     linesize[0] = layout.planes[C2PlanarLayout::PLANE_Y].rowInc;
     linesize[1] = layout.planes[C2PlanarLayout::PLANE_U].rowInc;
     linesize[2] = layout.planes[C2PlanarLayout::PLANE_V].rowInc;
+
+    if (mFrame->hw_frames_ctx) {
+        // One pass from the decoder's picture into the planar output buffer,
+        // instead of a copy to a temporary NV12 picture and sws_scale. Only
+        // for planar layouts with equal chroma strides and a luma stride the
+        // ROM's NEON 8-bit routine handles (width, or width rounded up to
+        // 128); checked per picture, as the size can change mid-stream.
+        const int w128 = (mFrame->width + 127) & ~127;
+        const bool direct = layout.planes[C2PlanarLayout::PLANE_Y].colInc == 1 &&
+                            layout.planes[C2PlanarLayout::PLANE_U].colInc == 1 &&
+                            layout.planes[C2PlanarLayout::PLANE_V].colInc == 1 &&
+                            linesize[1] == linesize[2] &&
+                            (linesize[0] == mFrame->width || linesize[0] == w128);
+        if (direct) {
+            AVFrame* dst = av_frame_alloc();
+            int err = AVERROR(ENOMEM);
+            if (dst) {
+                dst->format = AV_PIX_FMT_YUV420P;
+                dst->width = mFrame->width;
+                dst->height = mFrame->height;
+                for (int i = 0; i < 3; i++) {
+                    dst->data[i] = data[i];
+                    dst->linesize[i] = linesize[i];
+                }
+                // Marks dst as allocated so the transfer writes into the view.
+                dst->buf[0] = av_buffer_create(data[0], 1, noFree, NULL, 0);
+                err = dst->buf[0] ? av_hwframe_transfer_data(dst, mFrame, 0) : AVERROR(ENOMEM);
+                av_frame_free(&dst);
+            }
+            if (err == 0) {
+                return C2_OK;
+            }
+            if (err == AVERROR(ENOMEM)) {
+                ALOGE("getOutputBuffer: direct transfer out of memory");
+                return C2_NO_MEMORY;
+            }
+            // An older libavutil without this conversion: use the
+            // copy-and-convert path from now on.
+            ALOGW("getOutputBuffer: direct transfer failed (%s), using sws_scale", av_err2str(err));
+            mDirectTransferFailed = true;
+        }
+        int err = ffmpeg_hwaccel_get_frame(mCtx, mFrame);
+        if (err != 0) {
+            ALOGE("getOutputBuffer: failed to receive frame from HW decoder err = %d", err);
+            if (err == AVERROR(ENOMEM)) {
+                return C2_NO_MEMORY;
+            }
+            return C2_OMITTED; // skip the picture, as receiveFrame does
+        }
+    }
 
     mImgConvertCtx = sws_getCachedContext(currentImgConvertCtx,
            mFrame->width, mFrame->height, (AVPixelFormat)mFrame->format,
@@ -309,8 +404,12 @@ void C2FFMPEGVideoDecodeComponent::pushPendingWork(const std::unique_ptr<C2Work>
         switch (mCtx->codec_id) {
             case AV_CODEC_ID_HEVC:
             case AV_CODEC_ID_H264:
-                // Increase output delay step-wise.
-                if (outputDelay >= 18u) {
+                // Increase output delay step-wise. Hardware HEVC output
+                // buffers are 4K scanout buffers from the same CMA as the
+                // decoder's; 34 of them (~400 MB) exhaust it, so it stops at 12.
+                if (mCtx->hw_device_ctx && mCtx->codec_id == AV_CODEC_ID_HEVC) {
+                    newOutputDelay = outputDelay >= 8u ? 12u : 8u;
+                } else if (outputDelay >= 18u) {
                     newOutputDelay = 34u;
                 } else if (outputDelay >= 8u) {
                     newOutputDelay = 18u;
@@ -417,6 +516,14 @@ void C2FFMPEGVideoDecodeComponent::onRelease() {
 
 c2_status_t C2FFMPEGVideoDecodeComponent::onFlush_sm() {
     ALOGD("onFlush_sm");
+    if (mFrame) {
+        av_frame_unref(mFrame);  // see deInitDecoder
+    }
+    // The framework drops its pending work on flush; entries left here would
+    // never be finished, and after a backward seek they sort after every new
+    // timestamp, so the queue fills and new pictures get dropped.
+    mPendingWorkQueue.clear();
+    mPendingConfigUpdate.clear();
     if (mCtx && avcodec_is_open(mCtx)) {
         // Make sure that the next buffer output does not still
         // depend on fragments from the last one decoded.
@@ -431,7 +538,9 @@ c2_status_t C2FFMPEGVideoDecodeComponent::outputFrame(
     const std::shared_ptr<C2BlockPool> &pool
 ) {
     c2_status_t err;
-    std::vector<std::unique_ptr<C2Param>> configUpdate;
+    // A size change parked by a skipped picture goes out with this one.
+    std::vector<std::unique_ptr<C2Param>> configUpdate = std::move(mPendingConfigUpdate);
+    mPendingConfigUpdate.clear();
 
 #if DEBUG_FRAMES
     ALOGD("outputFrame: pts=%" PRId64 " dts=%" PRId64 " ts=%" PRId64 " - %d x %d (%x)",
@@ -475,6 +584,12 @@ c2_status_t C2FFMPEGVideoDecodeComponent::outputFrame(
     }
 
     err = getOutputBuffer(&wView);
+    if (err == C2_OMITTED) {
+        // Picture lost in the hardware transfer: skip it, as before, and keep
+        // any size change for the next picture.
+        mPendingConfigUpdate = std::move(configUpdate);
+        return C2_OK;
+    }
     if (err == C2_OK) {
         std::shared_ptr<C2Buffer> buffer = createGraphicBuffer(std::move(block), C2Rect(mFrame->width, mFrame->height));
 
